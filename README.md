@@ -1,116 +1,103 @@
-# Line Follower Robot
+# PS4-Controlled & Autonomous Line-Following Robot
 
-A two-wheeled robot that follows a line autonomously, avoids obstacles with an
-ultrasonic sensor, and can also be driven manually over WiFi (PS4 controller
-via ROS 2). Live wheel speed and obstacle status can be viewed wirelessly on
-a laptop GUI while the robot drives untethered.
+A two-wheel differential-drive robot built on **ROS 2 Jazzy** and an **ESP32**, controllable either manually with a PS4 controller or autonomously as a line follower with obstacle detection — switchable on the fly with a single controller button.
 
-![Robot](robot.jpg)
+![Robot](./assets/robot.jpeg)
 
-## How it works
+## Features
 
-```
- ┌─────────────┐   UART (E:/S: protocol)   ┌──────────────┐   UDP (WiFi)   ┌──────────────┐
- │   AVR MCU   │ ─────────────────────────▶ │    ESP32     │ ─────────────▶ │   Laptop     │
- │ (ATmega32)  │                            │              │                │  GUI / ROS2  │
- │             │                            │ - Motor PID  │ ◀───────────── │              │
- │ - 3x IR line│                            │ - Line follow│   UDP (cmd)    │              │
- │   sensors   │                            │ - Manual mode│                │              │
- │ - HC-SR04   │                            │ - Obstacle   │                │              │
- │   ultrasonic│                            │   stop       │                │              │
- └─────────────┘                            └──────────────┘                └──────────────┘
-```
+- **Manual control** via a PS4 (DualShock 4) controller, using ROS 2's `joy` and `teleop_twist_joy` packages
+- **Dual link options** between the laptop/Pi and the ESP32: WiFi (UDP, ESP32 as its own access point) or USB Serial — both accepted simultaneously
+- **Closed-loop speed control** on both wheels using quadrature encoders and a PID controller, so both motors track the same RPM regardless of manufacturing differences
+- **Smooth acceleration ramping** to avoid sudden jerks/wheelies when speed changes
+- **Autonomous line following** using 3 analog IR sensors read by a separate AVR microcontroller, which computes a weighted-average position error and streams it to the ESP32 over UART
+- **Obstacle detection**: the AVR reports a stop condition that immediately halts the robot regardless of the line-following logic
+- **One-button mode switch** (Manual ⇄ Line Follow) from the PS4 controller, or via a `MODE:TOGGLE` command over WiFi/Serial
+- **Safety watchdogs**: the robot stops automatically if the WiFi/Serial link drops (manual mode) or if the AVR sensor link drops (line-follow mode)
+- **Live wireless speed dashboard** showing both wheels' RPM in real time
 
-- The **AVR** reads 3 analog IR sensors, computes a line-position error, and
-  reads an HC-SR04 ultrasonic sensor for obstacle detection. It sends
-  `E:<error>` or `S:1` (obstacle) lines over UART to the ESP32.
-- The **ESP32** runs the motor PID/PWM control loop, decides target wheel
-  speed from either the line-follow error or manual UDP/Serial commands, and
-  broadcasts live telemetry (`L:<rpm> R:<rpm> OBS:<0/1>`) over WiFi.
-- The **laptop** can drive the robot manually (ROS 2 `wifi_bridge.py`,
-  `/cmd_vel` + joystick button to toggle mode) and/or watch live speed and
-  obstacle status wirelessly (`speed_display.py`).
-
-## Repository structure
-
-```
-.
-├── avr/
-│   ├── main.h              # UART, ADC, ultrasonic function implementations
-│   └── main.c              # main() - line-follow + obstacle-avoidance loop
-├── esp32/
-│   └── car_robot_ps4_final.ino   # motor control, line-follow, manual mode, telemetry
-├── laptop/
-│   ├── speed_display.py    # wireless GUI: live RPM + obstacle warning
-│   ├── wifi_bridge.py      # ROS2 node: /cmd_vel + /joy -> UDP commands
-│   └── robot.jpg           # robot photo used by speed_display.py
-└── README.md
-```
+![Speed dashboard](./assets/speed_dashboard.png)
 
 ## Hardware
 
-- **AVR (ATmega32)**
-  - 3x analog IR line sensors -> `ADC0`, `ADC1`, `ADC2` (`PA0`-`PA2`)
-  - HC-SR04 ultrasonic: `TRIG` -> `PD6`, `ECHO` -> `PB2`
-  - UART -> ESP32 `Serial2` (`RX2` = GPIO16, `TX2` = GPIO17), 9600 baud
-- **ESP32**
-  - Motor driver: `IN1`/`IN2` (right, GPIO27/26), `IN3`/`IN4` (left, GPIO25/14), PWM via `ledc`
-  - Wheel encoders: left `GPIO32`/`33`, right `GPIO19`/`21`
-  - WiFi Access Point: SSID `CarRobotPS4`, password `robot1234`
-
-## Firmware setup (PlatformIO)
-
-**AVR** — put the header in `include/`, the source in `src/`:
-```
-avr_project/
-├── platformio.ini
-├── include/
-│   └── main.h
-└── src/
-    └── main.c
-```
-
-**ESP32** — single `.ino` file works as-is in PlatformIO or Arduino IDE.
-
-## Communication protocol (AVR → ESP32, UART2 @ 9600)
-
-| Message | Meaning |
+| Component | Role |
 |---|---|
-| `E:<int>\n` | Line position error (negative = drifted left, positive = drifted right) |
-| `S:1\n` | Obstacle closer than `STOP_DISTANCE_CM` (10cm) - stop immediately |
-| `E:ADC_TIMEOUT\n` | ADC read failed (check AVCC/AREF wiring) |
+| ESP32 DevKit | Main controller: motor PID, WiFi AP, mode switching |
+| AVR microcontroller (8 MHz, bare-metal AVR-GCC) | Reads 3 analog IR sensors, computes line-position error, sends it to the ESP32 over UART |
+| 2× GA25-370 DC gear motors (12V, with encoders) | Drive wheels |
+| L293D motor driver | Drives both motors, PWM applied directly on the IN pins (ENA/ENB tied to 5V) |
+| PS4 (DualShock 4) controller | Manual driving input, connects to the laptop/Pi over Bluetooth |
+| Laptop / Raspberry Pi 4 running ROS 2 Jazzy | Runs `joy_node`, `teleop_twist_joy`, and the bridge node to the ESP32 |
 
-## Telemetry protocol (ESP32 → laptop, UDP broadcast, port 4211)
-
-```
-L:<left_rpm> R:<right_rpm> OBS:<0|1>
-```
-Broadcast ~10 times/sec to `192.168.4.255:4211`.
-
-## Manual control protocol (laptop → ESP32, UDP, port 4210)
+## System Architecture
 
 ```
-<left_pwm>,<right_pwm>    # e.g. "120,-80"
-MODE:TOGGLE                # switch between MANUAL and LINE_FOLLOW
+PS4 Controller (Bluetooth)
+        |
+    joy_node  ->  /joy
+        |
+teleop_twist_joy  ->  /cmd_vel
+        |
+  bridge node (WiFi UDP or USB Serial)
+        |
+        v
+      ESP32  <-- UART --  AVR (3x IR sensors)
+        |
+   PID + Encoders
+        |
+   L293D  ->  DC Motors
 ```
 
-## Running the laptop apps
+- In **MANUAL** mode, the ESP32 drives the wheels according to speed commands received over WiFi/Serial.
+- In **LINE_FOLLOW** mode, the ESP32 ignores manual commands and instead steers based on the position error streamed continuously by the AVR.
+- Both modes share the same underlying PID + encoder feedback loop for actually reaching the requested wheel speed.
+
+## Repository Contents
+
+| File | Description |
+|---|---|
+| `main.cpp` | ESP32 firmware: WiFi AP, UDP + Serial command handling, PID motor control, encoder reading, line-follow mode, obstacle stop |
+| `avr_line_sensor.c` | Bare-metal AVR-GCC firmware: reads 3 analog IR sensors, computes the line-position error, sends it over UART |
+| `wifi_bridge.py` | ROS 2 node: converts `/cmd_vel` to wheel speeds and sends them to the ESP32 over WiFi UDP; also forwards a mode-toggle command from a controller button |
+| `serial_bridge.py` | Same as above, but sends over USB Serial instead of WiFi |
+| `ps4_config.yaml` | `teleop_twist_joy` configuration mapping the PS4 controller's axes/buttons |
+
+## Setup
+
+1. Flash `avr_line_sensor.c` to the AVR board (built for an 8 MHz clock).
+2. Flash `main.cpp` to the ESP32 via PlatformIO/Arduino IDE.
+3. Wire the AVR's UART TX to the ESP32's UART2 RX (GPIO 16), with a common ground.
+4. On the laptop/Pi, install ROS 2 Jazzy and the required packages:
+   ```bash
+   sudo apt install ros-jazzy-joy ros-jazzy-teleop-twist-joy python3-serial
+   ```
+5. Pair the PS4 controller over Bluetooth.
+
+## Running It
 
 ```bash
-# Wireless speed/obstacle display (keep robot.jpg in the same folder)
-pip install pillow --break-system-packages
-python3 speed_display.py
+# Terminal 1
+ros2 run joy joy_node
 
-# ROS2 bridge for manual PS4 control
-ros2 run <your_package> wifi_bridge.py
+# Terminal 2
+ros2 run teleop_twist_joy teleop_node --ros-args --params-file ps4_config.yaml
+
+# Terminal 3 (choose one)
+python3 wifi_bridge.py     # connect to the "CarRobotPS4" WiFi network first
+# or
+python3 serial_bridge.py   # connect the ESP32 over USB
 ```
 
-Connect the laptop's WiFi to `CarRobotPS4` before running either.
+Drive the robot manually onto the line, then press the assigned controller button to switch into autonomous line-following mode. Press it again to take back manual control at any time.
 
-## Notes
+## Tuning Notes
 
-- Obstacle stop (`OBS`) takes priority over both manual and line-follow
-  driving - the robot stops immediately regardless of mode when the AVR
-  reports something closer than 10cm.
-- The ESP32 also accepts manual commands over USB Serial (115200 baud) as a
-  wired fallback to WiFi.
+- `Kp`, `Ki`, `Kd` in `main.cpp` control the wheel-speed PID loop.
+- `LINE_KP` and `LINE_BASE_RPM` control how aggressively and how fast the robot follows the line.
+- `MAX_TARGET_RPM` should match the motors' real achievable speed under load, not just their no-load datasheet rating.
+
+## Possible Next Steps
+
+- Move the WiFi bridge from a laptop to an onboard Raspberry Pi for a fully self-contained robot
+- Add a physical on/off switch for line-follow mode as a hardware-only fallback
+- Migrate the ESP32 link to ESP-NOW for longer, more reliable range than WiFi AP mode
