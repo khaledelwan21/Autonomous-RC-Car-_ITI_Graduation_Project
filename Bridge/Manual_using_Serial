@@ -1,0 +1,220 @@
+#include <Arduino.h>
+
+// Right motor pins (both PWM-capable)
+const int IN1 = 27;
+const int IN2 = 26;
+// Left motor pins (both PWM-capable)
+const int IN3 = 25;
+const int IN4 = 14;
+
+// LEDC channels: one per pin
+const int CH_IN1 = 0;
+const int CH_IN2 = 1;
+const int CH_IN3 = 2;
+const int CH_IN4 = 3;
+
+const int PWM_FREQ = 5000;
+const int PWM_RESOLUTION = 8;  // 8-bit -> values 0 to 255
+
+// Encoder pins
+const int ENCODER_A_LEFT  = 32;
+const int ENCODER_B_LEFT  = 33;
+const int ENCODER_A_RIGHT = 19;
+const int ENCODER_B_RIGHT = 21;
+
+String inputBuffer = "";
+
+volatile long pulseCount_Left = 0;
+volatile long pulseCount_Right = 0;
+
+unsigned long Pervious_Millis = 0;
+unsigned long Current_Millis = 0;
+unsigned int Period = 20; // ms - control loop interval
+
+float Rpm_Left_Wheel = 0;
+float Rpm_Right_Whell = 0;
+
+int leftSpeed = 0;
+int rightSpeed = 0;
+
+const int MAX_TARGET_RPM = 240;
+int targetLeft_Rpm = 0;
+int targetRight_Rpm = 0;
+
+float rampStep = 5.0; // RPM change per control loop
+float rampSetpoint_Left = 0.0;
+float rampSetpoint_Right = 0.0;
+
+float Kp = 3.0, Ki = 1.0, Kd = 0.0;
+
+float integral_Left = 0, lastError_Left = 0;
+float integral_Right = 0, lastError_Right = 0;
+
+// RPM below this = "stopped", regardless of noise or leftover integral
+const float STOP_THRESHOLD_RPM = 20.0;
+// RPM below this = ignore as encoder noise (used before PID sees it)
+const float NOISE_DEADBAND_RPM = 5.0;
+
+void setMotor(int chA, int chB, int speed);
+void stopMotors();
+void parseAndApply(String line);
+void updateRamp(float &ramped, float target);
+float computePID(float setpoint, float actual, float &integral, float &lastError, float dt);
+
+void IRAM_ATTR InterruptFunction_Left_Wheel(void) {
+  if (digitalRead(ENCODER_A_LEFT) == 1) pulseCount_Left--;
+  else pulseCount_Left++;
+}
+
+void IRAM_ATTR InterruptFunction_Right_Wheel(void) {
+  if (digitalRead(ENCODER_A_RIGHT) == 1) pulseCount_Right--;
+  else pulseCount_Right++;
+}
+
+void updateRamp(float &ramped, float target) {
+  if (ramped < target) {
+    ramped += rampStep;
+    if (ramped > target) ramped = target;
+  } else if (ramped > target) {
+    ramped -= rampStep;
+    if (ramped < target) ramped = target;
+  }
+}
+
+float computePID(float setpoint, float actual, float &integral, float &lastError, float dt) {
+  float error = setpoint - actual;
+  float derivative = (error - lastError) / dt;
+  lastError = error;
+
+  // Provisional output using current integral (before deciding whether to accumulate more)
+  float output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+  // Conditional integration: only accumulate if not already saturated
+  if (output < 255 && output > -255) {
+    integral += error * dt;
+  }
+
+  output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+  output = constrain(output, -255, 255);
+  return output;
+}
+
+void Get_Rpm(void)
+{
+    Current_Millis = millis();
+
+    if (Current_Millis - Pervious_Millis >= Period) {
+
+        float dt = (Current_Millis - Pervious_Millis) / 1000.0;
+        Pervious_Millis = Current_Millis;
+
+        Rpm_Left_Wheel  = ((pulseCount_Left  / 21.3)  / 11.0) * 60.0 / dt;
+        Rpm_Right_Whell = ((pulseCount_Right / 21.30) / 11.0) * 60.0 / dt;
+        pulseCount_Left = 0;
+        pulseCount_Right = 0;
+
+        // Ignore tiny encoder noise when robot is essentially still
+        if (abs(Rpm_Left_Wheel) < NOISE_DEADBAND_RPM)  Rpm_Left_Wheel = 0;
+        if (abs(Rpm_Right_Whell) < NOISE_DEADBAND_RPM) Rpm_Right_Whell = 0;
+
+        Serial.printf("RPM_Left: %.1f  RPM_Right: %.1f\n", Rpm_Left_Wheel, Rpm_Right_Whell);
+
+        float pwmLeft, pwmRight;
+
+        // ---- LEFT WHEEL ----
+        if (targetLeft_Rpm == 0 && abs(Rpm_Left_Wheel) < STOP_THRESHOLD_RPM) {
+            // Fully stopped: cut power and clear all PID state
+            pwmLeft = 0;
+            integral_Left = 0;
+            lastError_Left = 0;
+            rampSetpoint_Left = 0;
+        } else {
+            updateRamp(rampSetpoint_Left, targetLeft_Rpm);
+            pwmLeft = computePID(rampSetpoint_Left, Rpm_Left_Wheel, integral_Left, lastError_Left, dt);
+        }
+
+        // ---- RIGHT WHEEL ----
+        if (targetRight_Rpm == 0 && abs(Rpm_Right_Whell) < STOP_THRESHOLD_RPM) {
+            pwmRight = 0;
+            integral_Right = 0;
+            lastError_Right = 0;
+            rampSetpoint_Right = 0;
+        } else {
+            updateRamp(rampSetpoint_Right, targetRight_Rpm);
+            pwmRight = computePID(rampSetpoint_Right, Rpm_Right_Whell, integral_Right, lastError_Right, dt);
+        }
+
+        setMotor(CH_IN3, CH_IN4, (int)constrain(pwmLeft, -255, 255));
+        setMotor(CH_IN1, CH_IN2, (int)constrain(pwmRight, -255, 255));
+    }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  ledcSetup(CH_IN1, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_IN2, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_IN3, PWM_FREQ, PWM_RESOLUTION);
+  ledcSetup(CH_IN4, PWM_FREQ, PWM_RESOLUTION);
+
+  ledcAttachPin(IN1, CH_IN1);
+  ledcAttachPin(IN2, CH_IN2);
+  ledcAttachPin(IN3, CH_IN3);
+  ledcAttachPin(IN4, CH_IN4);
+
+  pinMode(ENCODER_A_LEFT, INPUT_PULLUP);
+  pinMode(ENCODER_B_LEFT, INPUT_PULLUP);
+  pinMode(ENCODER_A_RIGHT, INPUT_PULLUP);
+  pinMode(ENCODER_B_RIGHT, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B_LEFT), InterruptFunction_Left_Wheel, RISING);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_B_RIGHT), InterruptFunction_Right_Wheel, RISING);
+
+  stopMotors();
+  Serial.println("Ready. Send: leftSpeed,rightSpeed (-240 to 240)");
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\n') {
+      parseAndApply(inputBuffer);
+      inputBuffer = "";
+    } else if (c != '\r') {
+      inputBuffer += c;
+    }
+  }
+  Get_Rpm();
+}
+
+void parseAndApply(String line) {
+  int commaIndex = line.indexOf(',');
+  if (commaIndex == -1) return;
+
+  leftSpeed = line.substring(0, commaIndex).toInt();
+  rightSpeed = line.substring(commaIndex + 1).toInt();
+
+  leftSpeed = constrain(leftSpeed, -MAX_TARGET_RPM, MAX_TARGET_RPM);
+  rightSpeed = constrain(rightSpeed, -MAX_TARGET_RPM, MAX_TARGET_RPM);
+
+  targetLeft_Rpm = leftSpeed;
+  targetRight_Rpm = rightSpeed;
+}
+
+void setMotor(int chA, int chB, int speed) {
+  if (speed > 0) {
+    ledcWrite(chA, speed);
+    ledcWrite(chB, 0);
+  } else if (speed < 0) {
+    ledcWrite(chA, 0);
+    ledcWrite(chB, -speed);
+  } else {
+    ledcWrite(chA, 0);
+    ledcWrite(chB, 0);
+  }
+}
+
+void stopMotors() {
+  setMotor(CH_IN1, CH_IN2, 0);
+  setMotor(CH_IN3, CH_IN4, 0);
+}
